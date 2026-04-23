@@ -765,6 +765,9 @@ body.dark .cust-opt-name{color:#F1F5F9;}
       </button>
       <h1 id="pageTitle">Dashboard</h1>
       <div class="topbar-right">
+        <button class="dark-toggle-btn" id="refreshDataBtn" onclick="refreshAllData()" title="Refresh data dari Supabase" style="margin-right:2px">
+          <i data-lucide="refresh-cw"></i>
+        </button>
         <button class="dark-toggle-btn" id="darkToggleBtn" onclick="toggleDarkMode()" title="Ganti tema">
           <i data-lucide="moon" id="darkIcon"></i>
         </button>
@@ -830,6 +833,386 @@ body.dark .cust-opt-name{color:#F1F5F9;}
 <div class="toast-wrap" id="toastWrap"></div>
 
 <script>
+// ══════════════════════════════════════════════════════════
+// ── SUPABASE CONFIG ──
+// ══════════════════════════════════════════════════════════
+const SB_URL = 'https://paluwnngqfithovzsvxo.supabase.co';
+const SB_KEY = 'sb_publishable_dU-HOr7aQ-1NiD6YHuBIug_c1O4GMbT';
+
+/* ════════════════════════════════════════════════════════════
+   SUPABASE SQL SCHEMA — jalankan di Supabase SQL Editor:
+   ════════════════════════════════════════════════════════════
+
+create table if not exists businesses (
+  id serial primary key,
+  name text not null,
+  type text default 'F&B',
+  status text default 'active',
+  users int default 0,
+  transactions int default 0,
+  revenue bigint default 0,
+  feat_stok boolean default false
+);
+
+create table if not exists users (
+  id serial primary key,
+  name text not null,
+  email text unique not null,
+  role text not null,
+  biz_id int references businesses(id) on delete set null,
+  pass text not null,
+  initials text
+);
+
+create table if not exists products (
+  id serial primary key,
+  biz_id int references businesses(id) on delete cascade,
+  name text not null,
+  price bigint default 0,
+  stock int default 0,
+  cat text default 'Lainnya',
+  color text default '#1A56DB',
+  stock_mode text default 'unlimited'
+);
+
+create table if not exists transactions (
+  id serial primary key,
+  biz_id int references businesses(id) on delete cascade,
+  date text,
+  time text,
+  month text,
+  year int,
+  customer text,
+  phone text,
+  items jsonb,
+  total bigint default 0,
+  discount bigint default 0,
+  kasir text,
+  status text default 'lunas',
+  pay_method text default 'cash',
+  catatan text default ''
+);
+
+create table if not exists customers (
+  id serial primary key,
+  biz_id int references businesses(id) on delete cascade,
+  name text not null,
+  phone text,
+  visits int default 0,
+  total bigint default 0,
+  last_visit text
+);
+
+create table if not exists promos (
+  id serial primary key,
+  biz_id int references businesses(id) on delete cascade,
+  name text not null,
+  deskripsi text,
+  type text default 'percent',
+  value int default 0,
+  min_buy bigint default 0,
+  status text default 'active',
+  code text
+);
+
+-- Row Level Security (opsional, nonaktifkan jika pakai publishable key):
+alter table businesses enable row level security;
+alter table users enable row level security;
+alter table products enable row level security;
+alter table transactions enable row level security;
+alter table customers enable row level security;
+alter table promos enable row level security;
+
+-- Policy: allow all (untuk publishable key tanpa auth)
+create policy "allow_all" on businesses for all using (true) with check (true);
+create policy "allow_all" on users for all using (true) with check (true);
+create policy "allow_all" on products for all using (true) with check (true);
+create policy "allow_all" on transactions for all using (true) with check (true);
+create policy "allow_all" on customers for all using (true) with check (true);
+create policy "allow_all" on promos for all using (true) with check (true);
+
+-- Insert default superadmin:
+insert into users (name, email, role, biz_id, pass, initials)
+values ('Super Admin', 'admin@jagabisnis.id', 'superadmin', null, 'admin123', 'SA')
+on conflict (email) do nothing;
+
+   ════════════════════════════════════════════════════════════ */
+
+const sbHeaders = {
+  'Content-Type': 'application/json',
+  'apikey': SB_KEY,
+  'Authorization': 'Bearer ' + SB_KEY,
+  'Prefer': 'return=representation'
+};
+
+// ── Generic Supabase REST helpers ──
+async function sbGet(table, query=''){
+  const r = await fetch(`${SB_URL}/rest/v1/${table}?${query}`, {headers:{...sbHeaders,'Prefer':''}});
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function sbInsert(table, data){
+  const r = await fetch(`${SB_URL}/rest/v1/${table}`, {method:'POST',headers:sbHeaders,body:JSON.stringify(data)});
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function sbUpdate(table, match, data){
+  const q = Object.entries(match).map(([k,v])=>`${k}=eq.${encodeURIComponent(v)}`).join('&');
+  const r = await fetch(`${SB_URL}/rest/v1/${table}?${q}`, {method:'PATCH',headers:sbHeaders,body:JSON.stringify(data)});
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function sbDelete(table, match){
+  const q = Object.entries(match).map(([k,v])=>`${k}=eq.${encodeURIComponent(v)}`).join('&');
+  const r = await fetch(`${SB_URL}/rest/v1/${table}?${q}`, {method:'DELETE',headers:{...sbHeaders,'Prefer':''}});
+  if(!r.ok) throw new Error(await r.text());
+  return true;
+}
+async function sbUpsert(table, data, onConflict){
+  const url = onConflict ? `${SB_URL}/rest/v1/${table}?on_conflict=${onConflict}` : `${SB_URL}/rest/v1/${table}`;
+  const r = await fetch(url, {method:'POST',headers:{...sbHeaders,'Prefer':'resolution=merge-duplicates,return=representation'},body:JSON.stringify(data)});
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ── Loading overlay helpers ──
+function showLoading(msg='Memuat data...'){
+  let el=document.getElementById('sbLoading');
+  if(!el){
+    el=document.createElement('div');el.id='sbLoading';
+    el.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:99999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px)';
+    el.innerHTML=`<div style="background:#fff;border-radius:14px;padding:28px 36px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.3)">
+      <div style="width:40px;height:40px;border:3px solid #E2E8F0;border-top-color:#1A56DB;border-radius:50%;animation:spin .7s linear infinite;margin:0 auto 14px"></div>
+      <div style="font-size:14px;font-weight:600;color:#0F172A" id="sbLoadingMsg">${msg}</div>
+    </div>
+    <style>@keyframes spin{to{transform:rotate(360deg)}}</style>`;
+    document.body.appendChild(el);
+  } else { document.getElementById('sbLoadingMsg').textContent=msg; el.style.display='flex'; }
+}
+function hideLoading(){ const el=document.getElementById('sbLoading'); if(el) el.style.display='none'; }
+
+// ══════════════════════════════════════════════════════════
+// ── SUPABASE DATA SYNC FUNCTIONS ──
+// ══════════════════════════════════════════════════════════
+
+// ── BUSINESSES ──
+async function sbLoadBusinesses(){
+  const data = await sbGet('businesses','order=id.asc');
+  DB.businesses = data.map(b=>({
+    id:b.id, name:b.name, type:b.type, status:b.status,
+    users:b.users||0, transactions:b.transactions||0,
+    revenue:b.revenue||0, featStok:b.feat_stok||false
+  }));
+}
+async function sbSaveBusiness(biz){
+  const row={name:biz.name,type:biz.type,status:biz.status,
+    users:biz.users,transactions:biz.transactions,
+    revenue:biz.revenue,feat_stok:biz.featStok};
+  if(biz.id && typeof biz.id==='number' && biz.id>0 && DB.businesses.find(b=>b.id===biz.id && b._saved)){
+    await sbUpdate('businesses',{id:biz.id},row);
+  } else {
+    const res=await sbInsert('businesses',row);
+    if(res&&res[0]) biz.id=res[0].id;
+    biz._saved=true;
+  }
+}
+async function sbUpdateBusiness(id, data){
+  const row={};
+  if(data.status!==undefined) row.status=data.status;
+  if(data.feat_stok!==undefined) row.feat_stok=data.feat_stok;
+  if(data.revenue!==undefined) row.revenue=data.revenue;
+  if(data.transactions!==undefined) row.transactions=data.transactions;
+  if(data.users!==undefined) row.users=data.users;
+  if(Object.keys(row).length) await sbUpdate('businesses',{id},row);
+}
+
+// ── USERS ──
+async function sbLoadUsers(){
+  const data = await sbGet('users','order=id.asc');
+  DB.users = data.map(u=>({
+    id:u.id, name:u.name, email:u.email,
+    role:u.role, bizId:u.biz_id,
+    pass:u.pass, initials:u.initials||u.name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2)
+  }));
+  // Always ensure superadmin exists locally
+  if(!DB.users.find(u=>u.role==='superadmin')){
+    DB.users.unshift({id:0,name:'Super Admin',email:'admin@jagabisnis.id',role:'superadmin',bizId:null,pass:'admin123',initials:'SA'});
+  }
+}
+async function sbSaveUser(user){
+  const row={name:user.name,email:user.email,role:user.role,
+    biz_id:user.bizId||null,pass:user.pass,
+    initials:user.initials||user.name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2)};
+  const res=await sbInsert('users',row);
+  if(res&&res[0]) user.id=res[0].id;
+  return user;
+}
+async function sbUpdateUser(id, data){
+  const row={};
+  if(data.name) row.name=data.name;
+  if(data.email) row.email=data.email;
+  if(data.role) row.role=data.role;
+  if(data.pass) row.pass=data.pass;
+  if(data.initials) row.initials=data.initials;
+  if(data.bizId!==undefined) row.biz_id=data.bizId;
+  await sbUpdate('users',{id},row);
+}
+async function sbDeleteUser(id){ await sbDelete('users',{id}); }
+
+// ── PRODUCTS ──
+async function sbLoadProducts(bizId){
+  const q = bizId ? `biz_id=eq.${bizId}&order=id.asc` : 'order=id.asc';
+  const data = await sbGet('products',q);
+  if(bizId){
+    DB.products = DB.products.filter(p=>p.bizId!==bizId);
+  } else {
+    DB.products=[];
+  }
+  data.forEach(p=>DB.products.push({
+    id:p.id,bizId:p.biz_id,name:p.name,price:p.price,
+    stock:p.stock||0,cat:p.cat,color:p.color||'#1A56DB',
+    stockMode:p.stock_mode||'unlimited'
+  }));
+}
+async function sbSaveProduct(prod){
+  const row={biz_id:prod.bizId,name:prod.name,price:prod.price,
+    stock:prod.stock||0,cat:prod.cat,color:prod.color,
+    stock_mode:prod.stockMode||'unlimited'};
+  const res=await sbInsert('products',row);
+  if(res&&res[0]) prod.id=res[0].id;
+  return prod;
+}
+async function sbUpdateProduct(id, data){
+  const row={};
+  if(data.name!==undefined) row.name=data.name;
+  if(data.price!==undefined) row.price=data.price;
+  if(data.stock!==undefined) row.stock=data.stock;
+  if(data.cat!==undefined) row.cat=data.cat;
+  if(data.color!==undefined) row.color=data.color;
+  if(data.stockMode!==undefined) row.stock_mode=data.stockMode;
+  await sbUpdate('products',{id},row);
+}
+async function sbDeleteProduct(id){ await sbDelete('products',{id}); }
+
+// ── TRANSACTIONS ──
+async function sbLoadTransactions(bizId){
+  const q = bizId ? `biz_id=eq.${bizId}&order=id.asc` : 'order=id.asc';
+  const data = await sbGet('transactions',q);
+  if(bizId) DB.transactions=DB.transactions.filter(t=>t.bizId!==bizId);
+  else DB.transactions=[];
+  data.forEach(t=>DB.transactions.push({
+    id:t.id,bizId:t.biz_id,date:t.date,time:t.time,
+    month:t.month,year:t.year,customer:t.customer,phone:t.phone||'',
+    items:typeof t.items==='string'?JSON.parse(t.items):t.items,
+    total:t.total,discount:t.discount||0,
+    kasir:t.kasir,status:t.status,
+    payMethod:t.pay_method||'cash',catatan:t.catatan||''
+  }));
+  if(DB.transactions.length>0){
+    DB.nextTxId=Math.max(...DB.transactions.map(t=>t.id))+1;
+  }
+}
+async function sbSaveTransaction(tx){
+  const row={biz_id:tx.bizId,date:tx.date,time:tx.time||'',
+    month:tx.month,year:tx.year,customer:tx.customer,
+    phone:tx.phone||'',items:JSON.stringify(tx.items),
+    total:tx.total,discount:tx.discount||0,
+    kasir:tx.kasir,status:tx.status,
+    pay_method:tx.payMethod||'cash',catatan:tx.catatan||''};
+  const res=await sbInsert('transactions',row);
+  if(res&&res[0]) tx.id=res[0].id;
+  return tx;
+}
+async function sbUpdateTransactionStatus(id, status){ await sbUpdate('transactions',{id},{status}); }
+async function sbUpdateTransactionCatatan(id, catatan){ await sbUpdate('transactions',{id},{catatan}); }
+
+// ── CUSTOMERS ──
+async function sbLoadCustomers(bizId){
+  const q = bizId ? `biz_id=eq.${bizId}&order=id.asc` : 'order=id.asc';
+  const data = await sbGet('customers',q);
+  if(bizId) DB.customers=DB.customers.filter(c=>c.bizId!==bizId);
+  else DB.customers=[];
+  data.forEach(c=>DB.customers.push({
+    id:c.id,bizId:c.biz_id,name:c.name,phone:c.phone||'',
+    visits:c.visits||0,total:c.total||0,lastVisit:c.last_visit||'-'
+  }));
+}
+async function sbSaveCustomer(cust){
+  const row={biz_id:cust.bizId,name:cust.name,phone:cust.phone||'',
+    visits:cust.visits||0,total:cust.total||0,last_visit:cust.lastVisit||'-'};
+  const res=await sbInsert('customers',row);
+  if(res&&res[0]) cust.id=res[0].id;
+  return cust;
+}
+async function sbUpdateCustomer(id, data){
+  const row={};
+  if(data.visits!==undefined) row.visits=data.visits;
+  if(data.total!==undefined) row.total=data.total;
+  if(data.lastVisit!==undefined) row.last_visit=data.lastVisit;
+  await sbUpdate('customers',{id},row);
+}
+
+// ── PROMOS ──
+async function sbLoadPromos(bizId){
+  const q = bizId ? `biz_id=eq.${bizId}&order=id.asc` : 'order=id.asc';
+  const data = await sbGet('promos',q);
+  if(bizId) DB.promos=DB.promos.filter(p=>p.bizId!==bizId);
+  else DB.promos=[];
+  data.forEach(p=>DB.promos.push({
+    id:p.id,bizId:p.biz_id,name:p.name,desc:p.deskripsi||'',
+    type:p.type,value:p.value,minBuy:p.min_buy||0,
+    status:p.status,code:p.code||''
+  }));
+}
+async function sbSavePromo(promo){
+  const row={biz_id:promo.bizId,name:promo.name,deskripsi:promo.desc||'',
+    type:promo.type,value:promo.value,min_buy:promo.minBuy||0,
+    status:promo.status,code:promo.code||''};
+  const res=await sbInsert('promos',row);
+  if(res&&res[0]) promo.id=res[0].id;
+  return promo;
+}
+async function sbUpdatePromo(id, data){ await sbUpdate('promos',{id},data); }
+async function sbDeletePromo(id){ await sbDelete('promos',{id}); }
+
+// ── Refresh all data from Supabase ──
+async function refreshAllData(){
+  const btn=document.getElementById('refreshDataBtn');
+  if(btn) btn.style.opacity='0.4';
+  try{
+    await sbLoadAll();
+    // Re-render current page
+    const active=document.querySelector('.nav-item.active');
+    if(active){
+      const id=active.id.replace('nav-','');
+      navigateTo(id);
+    }
+    toast('Data berhasil diperbarui','success');
+  }catch(e){
+    toast('Gagal refresh: '+e.message,'error');
+  }finally{
+    if(btn){btn.style.opacity='';lucide.createIcons();}
+  }
+}
+
+// ── Load all data for current session ──
+async function sbLoadAll(){
+  const u=DB.currentUser;
+  if(!u) return;
+  showLoading('Memuat data...');
+  try{
+    if(u.role==='superadmin'){
+      await Promise.all([sbLoadBusinesses(),sbLoadUsers(),sbLoadTransactions(),sbLoadProducts(),sbLoadCustomers(),sbLoadPromos()]);
+    } else {
+      const biz=u.bizId;
+      await Promise.all([sbLoadBusinesses(),sbLoadUsers(),sbLoadProducts(biz),sbLoadTransactions(biz),sbLoadCustomers(biz),sbLoadPromos(biz)]);
+    }
+  }catch(e){
+    toast('Gagal memuat data: '+e.message,'error');
+    console.error(e);
+  }finally{ hideLoading(); }
+}
+
 // ── after DOM: init Lucide ──
 document.addEventListener('DOMContentLoaded', () => {
   lucide.createIcons();
@@ -955,49 +1338,43 @@ function toggleLoginPassVis(){
     :`<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>`;
 }
 
-// ── LOCALSTORAGE PERSISTENCE FOR USERS ──
-function saveUsersToStorage(){
-  try{localStorage.setItem('jb_users',JSON.stringify(DB.users));}catch(e){}
-}
-function loadUsersFromStorage(){
-  try{
-    const saved=localStorage.getItem('jb_users');
-    if(saved){
-      const parsed=JSON.parse(saved);
-      if(Array.isArray(parsed)&&parsed.length>0){
-        // Pastikan superadmin default selalu ada
-        const hasSA=parsed.find(u=>u.email==='admin@jagabisnis.id'&&u.role==='superadmin');
-        if(!hasSA){
-          const sa=DB.users.find(u=>u.role==='superadmin');
-          if(sa) parsed.unshift(sa);
-        }
-        DB.users=parsed;
-      }
-    }
-  }catch(e){}
-}
-// Load saved users on startup
-loadUsersFromStorage();
+// ── saveUsersToStorage: no-op (data now in Supabase) ──
+function saveUsersToStorage(){}
 
 // ═══════════════════════════════ AUTH ═══════════════════════════════
-function doLogin(){
+async function doLogin(){
   const e=document.getElementById('loginEmail').value.trim();
   const p=document.getElementById('loginPass').value.trim();
   const errEl=document.getElementById('loginError');
-  const u=DB.users.find(x=>x.email===e&&x.pass===p);
-  if(!u){
-    errEl.classList.add('show');
-    document.getElementById('loginPass').value='';
-    document.getElementById('loginPass').focus();
-    return;
+  const btn=document.querySelector('.btn-login');
+  if(!e||!p){errEl.classList.add('show');return;}
+  btn.disabled=true;btn.innerHTML='<span style="opacity:.7">Memproses...</span>';
+  try{
+    // Load users from Supabase first
+    await sbLoadUsers();
+    const u=DB.users.find(x=>x.email===e&&x.pass===p);
+    if(!u){
+      errEl.classList.add('show');
+      document.getElementById('loginPass').value='';
+      document.getElementById('loginPass').focus();
+      btn.disabled=false;btn.innerHTML='<i data-lucide="log-in"></i> Masuk ke Platform';lucide.createIcons();
+      return;
+    }
+    errEl.classList.remove('show');
+    // Load businesses to check status
+    await sbLoadBusinesses();
+    if(u.bizId){const b=DB.businesses.find(x=>x.id===u.bizId);if(b&&b.status==='inactive'){toast('Akun bisnis tidak aktif. Hubungi Super Admin.','error');btn.disabled=false;btn.innerHTML='<i data-lucide="log-in"></i> Masuk ke Platform';lucide.createIcons();return;}}
+    DB.currentUser=u;
+    document.getElementById('splash').classList.add('out');
+    setTimeout(()=>document.getElementById('splash').style.display='none',500);
+    document.getElementById('app').classList.add('visible');
+    // Load all data then init
+    await sbLoadAll();
+    initApp();
+  }catch(err){
+    toast('Koneksi gagal: '+err.message,'error');
+    btn.disabled=false;btn.innerHTML='<i data-lucide="log-in"></i> Masuk ke Platform';lucide.createIcons();
   }
-  errEl.classList.remove('show');
-  if(u.bizId){const b=DB.businesses.find(x=>x.id===u.bizId);if(b&&b.status==='inactive'){toast('Akun bisnis tidak aktif. Hubungi Super Admin.','error');return;}}
-  DB.currentUser=u;
-  document.getElementById('splash').classList.add('out');
-  setTimeout(()=>document.getElementById('splash').style.display='none',500);
-  document.getElementById('app').classList.add('visible');
-  initApp();
 }
 function doLogout(){
   DB.cart=[];DB.activePromo=null;DB.currentUser=null;
@@ -1202,7 +1579,7 @@ function renderSADash(){
         <td><label class="toggle-switch"><input type="checkbox" ${b.status==='active'?'checked':''} onchange="toggleBiz(${b.id},this.checked)"><span class="toggle-slider"></span></label></td>
       </tr>`).join('')}</tbody></table></div></div>`;
 }
-function toggleBiz(id,v){const b=DB.businesses.find(x=>x.id===id);b.status=v?'active':'inactive';toast(`${b.name} ${v?'diaktifkan':'dinonaktifkan'}`,v?'success':'warning');}
+function toggleBiz(id,v){const b=DB.businesses.find(x=>x.id===id);b.status=v?'active':'inactive';toast(`${b.name} ${v?'diaktifkan':'dinonaktifkan'}`,v?'success':'warning');if(id)sbUpdateBusiness(id,{status:b.status}).catch(()=>{});}
 
 function renderSABiz(){
   document.getElementById('mainContent').innerHTML=`
@@ -1363,22 +1740,18 @@ function addBusiness(){
     toast('Email sudah digunakan akun lain','error');return;
   }
 
-  const bizId=DB.businesses.length+1;
-  DB.businesses.push({id:bizId,name,type,status:'active',users:1,transactions:0,revenue:0,featStok:false});
-
+  const biz={id:null,name,type,status:'active',users:1,transactions:0,revenue:0,featStok:false};
+  DB.businesses.push(biz);
   const initials=mgrName.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2);
-  DB.users.push({
-    id:DB.users.length+1,
-    name:mgrName,
-    email:mgrEmail,
-    role:'admin',
-    bizId,
-    pass:mgrPass,
-    initials,
-  });
-
+  const user={id:null,name:mgrName,email:mgrEmail,role:'admin',bizId:null,pass:mgrPass,initials};
+  DB.users.push(user);
   closeModal();
   toast(`Bisnis "${name}" & akun manager berhasil dibuat!`,'success');
+  // Save to Supabase
+  sbInsert('businesses',{name,type,status:'active',users:1,transactions:0,revenue:0,feat_stok:false})
+    .then(res=>{
+      if(res&&res[0]){biz.id=res[0].id;user.bizId=res[0].id;return sbSaveUser(user);}
+    }).catch(err=>toast('Gagal simpan bisnis: '+err.message,'error'));
   renderSABiz();
 }
 
@@ -1428,10 +1801,12 @@ function addManagerForBiz(bizId){
   const old=DB.users.find(u=>u.bizId===bizId&&u.role==='admin');
   if(old) DB.users=DB.users.filter(u=>u.id!==old.id);
   const initials=name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2);
-  DB.users.push({id:DB.users.length+1,name,email,role:'admin',bizId,pass,initials});
+  const user={id:null,name,email,role:'admin',bizId,pass,initials};
+  DB.users.push(user);
   closeModal();
   toast(`Manager "${name}" berhasil ditambahkan!`,'success');
   saveUsersToStorage();
+  sbSaveUser(user).catch(err=>toast('Gagal simpan manager: '+err.message,'error'));
   renderSABiz();
 }
 
@@ -1440,6 +1815,7 @@ function hapusUser(userId,from){
   DB.users=DB.users.filter(u=>u.id!==userId);
   saveUsersToStorage();
   toast('Akun dihapus','warning');
+  if(userId) sbDeleteUser(userId).catch(err=>toast('Gagal hapus user: '+err.message,'error'));
   if(from==='users') renderSAUsers();
 }
 
@@ -1540,8 +1916,11 @@ function saveAddManagerDirect(){
   if(pass2&&pass!==pass2){toast('Konfirmasi password tidak sama!','error');return;}
   if(DB.users.find(u=>u.email===email)){toast('Email sudah digunakan','error');return;}
   const initials=name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2);
-  DB.users.push({id:DB.users.length+1,name,email,role:'admin',bizId,pass,initials});
-  closeModal();toast(`Manager "${name}" berhasil ditambahkan!`,'success');saveUsersToStorage();renderSAUsers();
+  const user={id:null,name,email,role:'admin',bizId,pass,initials};
+  DB.users.push(user);
+  closeModal();toast(`Manager "${name}" berhasil ditambahkan!`,'success');saveUsersToStorage();
+  sbSaveUser(user).catch(err=>toast('Gagal simpan manager: '+err.message,'error'));
+  renderSAUsers();
 }
 
 function showEditUser(userId){
@@ -1598,6 +1977,7 @@ function saveEditUser(userId){
   u.initials=name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2);
   if(pass) u.pass=pass;
   saveUsersToStorage();
+  if(u.id) sbUpdateUser(u.id,{name:u.name,email:u.email,role:u.role,initials:u.initials,...(pass?{pass}:{})}).catch(err=>toast('Gagal update user: '+err.message,'error'));
   closeModal();toast('Data pengguna diperbarui!','success');renderSAUsers();
 }
 
@@ -1748,6 +2128,7 @@ function toggleFeatStok(bizId,active){
   const b=DB.businesses.find(x=>x.id===bizId);
   b.featStok=active;
   toast(`Stok untuk "${b.name}" ${active?'diaktifkan':'dinonaktifkan'}`,active?'success':'warning');
+  if(bizId) sbUpdateBusiness(bizId,{feat_stok:active}).catch(()=>{});
   renderSAFeatures();
 }
 const gProds=()=>DB.products.filter(p=>p.bizId===gBizId());
@@ -1916,8 +2297,10 @@ function addProduct(){
   const cat=document.getElementById('p_cat').value;
   const color=document.getElementById('p_color').value;
   if(!name||!price){toast('Nama dan harga wajib','error');return;}
-  DB.products.push({id:DB.products.length+1,bizId:gBizId(),name,price,stock,cat,color,stockMode});
+  const prod={id:null,bizId:gBizId(),name,price,stock,cat,color,stockMode};
+  DB.products.push(prod);
   closeModal();toast('Produk ditambahkan!','success');renderAdminProducts();
+  sbSaveProduct(prod).catch(err=>toast('Gagal simpan produk: '+err.message,'error'));
 }
 function showEditProduct(id){
   const p=DB.products.find(x=>x.id===id);
@@ -1963,6 +2346,7 @@ function saveEditProduct(id){
   const modeEl=document.getElementById('p_stockmode');
   if(stokOn&&modeEl) p.stockMode=modeEl.value;
   closeModal();toast('Produk diperbarui','success');renderAdminProducts();
+  if(id) sbUpdateProduct(id,p).catch(err=>toast('Gagal update produk: '+err.message,'error'));
 }
 // Stock mode selector helper (called from modal onclick)
 function selectStockMode(mode){
@@ -1973,7 +2357,7 @@ function selectStockMode(mode){
   const inp=document.getElementById('p_stockmode');
   if(inp) inp.value=mode;
 }
-function deleteProduct(id){if(!confirm('Hapus produk ini?'))return;DB.products=DB.products.filter(p=>p.id!==id);toast('Produk dihapus','warning');renderAdminProducts();}
+function deleteProduct(id){if(!confirm('Hapus produk ini?'))return;DB.products=DB.products.filter(p=>p.id!==id);toast('Produk dihapus','warning');renderAdminProducts();if(id)sbDeleteProduct(id).catch(err=>toast('Gagal hapus produk: '+err.message,'error'));}
 
 // ═══════════════════════════════ ADMIN TRANSACTIONS ═══════════════════════════════
 function renderAdminTx(filter){
@@ -2205,11 +2589,13 @@ function upLbl(){document.getElementById('pr_vl').textContent=document.getElemen
 function addPromo(){
   const name=document.getElementById('pr_name').value.trim(),desc=document.getElementById('pr_desc').value.trim(),type=document.getElementById('pr_type').value,value=parseInt(document.getElementById('pr_value').value)||0,minBuy=parseInt(document.getElementById('pr_min').value)||0,code=document.getElementById('pr_code').value.trim().toUpperCase();
   if(!name||!value){toast('Nama dan nilai wajib','error');return;}
-  DB.promos.push({id:DB.promos.length+1,bizId:gBizId(),name,desc,type,value,minBuy,status:'active',code:code||'PROMO'});
+  const promo={id:null,bizId:gBizId(),name,desc,type,value,minBuy,status:'active',code:code||'PROMO'};
+  DB.promos.push(promo);
   closeModal();toast('Promo berhasil dibuat!','success');renderAdminPromo();
+  sbSavePromo(promo).catch(err=>toast('Gagal simpan promo: '+err.message,'error'));
 }
-function togglePromo(id,v){const p=DB.promos.find(x=>x.id===id);p.status=v?'active':'inactive';toast(`Promo "${p.name}" ${v?'diaktifkan':'dinonaktifkan'}`,v?'success':'warning');renderAdminPromo();}
-function deletePromo(id){if(!confirm('Hapus promo ini?'))return;DB.promos=DB.promos.filter(p=>p.id!==id);toast('Promo dihapus','warning');renderAdminPromo();}
+function togglePromo(id,v){const p=DB.promos.find(x=>x.id===id);p.status=v?'active':'inactive';toast(`Promo "${p.name}" ${v?'diaktifkan':'dinonaktifkan'}`,v?'success':'warning');renderAdminPromo();if(id)sbUpdatePromo(id,{status:p.status}).catch(()=>{});}
+function deletePromo(id){if(!confirm('Hapus promo ini?'))return;DB.promos=DB.promos.filter(p=>p.id!==id);toast('Promo dihapus','warning');renderAdminPromo();if(id)sbDeletePromo(id).catch(()=>{});}
 
 // ═══════════════════════════════ ADMIN CUSTOMERS ═══════════════════════════════
 function renderAdminCustomers(){
@@ -2239,8 +2625,10 @@ function showAddCustomer(){
 function addCustomer(){
   const name=document.getElementById('c_name').value.trim(),phone=document.getElementById('c_phone').value.trim();
   if(!name){toast('Nama wajib','error');return;}
-  DB.customers.push({id:DB.customers.length+1,bizId:gBizId(),name,phone,visits:0,total:0,lastVisit:'-'});
+  const cust={id:null,bizId:gBizId(),name,phone,visits:0,total:0,lastVisit:'-'};
+  DB.customers.push(cust);
   closeModal();toast('Customer ditambahkan!','success');renderAdminCustomers();
+  sbSaveCustomer(cust).catch(err=>toast('Gagal simpan customer: '+err.message,'error'));
 }
 function showFollowUp(name,phone){
   const biz=gBiz();
@@ -2516,9 +2904,12 @@ function addKasir(){
   const name=document.getElementById('k_name').value.trim(),email=document.getElementById('k_email').value.trim(),pass=document.getElementById('k_pass').value.trim();
   if(!name||!email||!pass){toast('Semua field wajib','error');return;}
   if(DB.users.find(u=>u.email===email)){toast('Email sudah digunakan','error');return;}
-  DB.users.push({id:DB.users.length+1,name,email,role:'kasir',bizId:gBizId(),pass,initials:name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2)});
+  const initials=name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2);
+  const user={id:null,name,email,role:'kasir',bizId:gBizId(),pass,initials};
+  DB.users.push(user);
   saveUsersToStorage();
   closeModal();toast(`Kasir "${name}" ditambahkan!`,'success');renderAdminUsers();
+  sbSaveUser(user).catch(err=>toast('Gagal simpan kasir: '+err.message,'error'));
 }
 
 // ═══════════════════════════════ POS ═══════════════════════════════
@@ -2823,8 +3214,8 @@ function doPayment(cust){
   const tx={id:txId,bizId:DB.currentUser.bizId,date:dateStr,time:timeStr,month:monthStr,year:wib.getUTCFullYear(),customer:cust.name,phone:cust.phone,items,total,discount:disc,kasir:DB.currentUser.name,status:'lunas',payMethod:method,cashReceived,cashChange};
   DB.transactions.push(tx);biz.transactions++;biz.revenue+=total;
   let c=DB.customers.find(x=>x.bizId===DB.currentUser.bizId&&x.name===cust.name);
-  if(c){c.visits++;c.total+=total;c.lastVisit=dateStr;}
-  else if(cust.name!=='Pelanggan')DB.customers.push({id:DB.customers.length+1,bizId:DB.currentUser.bizId,name:cust.name,phone:cust.phone,visits:1,total,lastVisit:dateStr});
+  if(c){c.visits++;c.total+=total;c.lastVisit=dateStr;if(c.id)sbUpdateCustomer(c.id,{visits:c.visits,total:c.total,lastVisit:dateStr}).catch(()=>{});}
+  else if(cust.name!=='Pelanggan'){const nc={id:null,bizId:DB.currentUser.bizId,name:cust.name,phone:cust.phone,visits:1,total,lastVisit:dateStr};DB.customers.push(nc);sbSaveCustomer(nc).catch(()=>{});}
 
   // ── Kurangi stok tracked otomatis ──
   if(bizStokEnabled(DB.currentUser.bizId)){
@@ -2832,7 +3223,7 @@ function doPayment(cust){
       const prod=DB.products.find(p=>p.bizId===DB.currentUser.bizId&&p.name===item.name);
       if(prod&&(prod.stockMode==='tracked')){
         prod.stock=Math.max(0,prod.stock-item.qty);
-        // Notifikasi jika stok kritis setelah pengurangan
+        if(prod.id) sbUpdateProduct(prod.id,{stock:prod.stock}).catch(()=>{});
         if(prod.stock===0) toast(`Stok ${prod.name} habis!`,'error');
         else if(prod.stock<=5) toast(`Stok ${prod.name} tersisa ${prod.stock}!`,'warning');
       }
@@ -2840,6 +3231,10 @@ function doPayment(cust){
   }
 
   DB.cart=[];DB.activePromo=null;window._payMethod='cash';
+  // Save to Supabase async
+  sbSaveTransaction(tx).then(()=>{
+    sbUpdateBusiness(tx.bizId,{revenue:biz.revenue,transactions:biz.transactions}).catch(()=>{});
+  }).catch(err=>toast('Gagal simpan transaksi: '+err.message,'error'));
   showReceipt(tx,biz);
 }
 function showReceipt(tx,biz){
@@ -2942,7 +3337,11 @@ function showReceipt(tx,biz){
 
 // ── CATATAN TRANSAKSI ──
 function saveCatatan(txId,val){
-  const t=DB.transactions.find(x=>x.id===txId);if(t)t.catatan=val;
+  const t=DB.transactions.find(x=>x.id===txId);if(t){t.catatan=val;}
+  if(txId) clearTimeout(window._catatanTimer);
+  window._catatanTimer=setTimeout(()=>{
+    if(txId) sbUpdateTransactionCatatan(txId,val).catch(()=>{});
+  },1000);
 }
 
 // ── GENERATE HALAMAN STRUK ONLINE (Blob URL) ──
@@ -3152,6 +3551,7 @@ function toggleTxStatus(id,from){
   const t=DB.transactions.find(x=>x.id===id);if(!t)return;
   t.status=t.status==='lunas'?'belum lunas':'lunas';
   toast(`TXN-00${id} → ${t.status}`,t.status==='lunas'?'success':'warning');
+  if(id) sbUpdateTransactionStatus(id,t.status).catch(err=>toast('Gagal update status: '+err.message,'error'));
   if(from==='kasir')renderKasirHistory();else renderAdminTx();
 }
 
