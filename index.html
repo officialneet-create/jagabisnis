@@ -6,6 +6,9 @@
 <title>JagaBisnis — Multi-Bisnis POS</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <style>
 :root{
   --brand:#1A56DB;--brand-dark:#1043b5;--brand-light:#EBF2FF;
@@ -700,6 +703,7 @@ body.dark .cust-opt-name{color:#F1F5F9;}
   <div class="login-card">
     <h2>Selamat Datang</h2>
     <p>Masuk ke sistem POS multi-bisnis Anda</p>
+    <div id="sbStatusBanner" style="display:none;font-size:12px;padding:10px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #f59e0b55;background:#f59e0b18;color:#b45309;line-height:1.5;"></div>
     <div class="login-error" id="loginError">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
       <span>Email atau password salah. Silakan coba lagi.</span>
@@ -907,7 +911,7 @@ create table if not exists promos (
   id serial primary key,
   biz_id int references businesses(id) on delete cascade,
   name text not null,
-  deskripsi text,
+  desc text,
   type text default 'percent',
   value int default 0,
   min_buy bigint default 0,
@@ -1159,13 +1163,13 @@ async function sbLoadPromos(bizId){
   if(bizId) DB.promos=DB.promos.filter(p=>p.bizId!==bizId);
   else DB.promos=[];
   data.forEach(p=>DB.promos.push({
-    id:p.id,bizId:p.biz_id,name:p.name,desc:p.deskripsi||'',
+    id:p.id,bizId:p.biz_id,name:p.name,desc:p.desc||'',
     type:p.type,value:p.value,minBuy:p.min_buy||0,
     status:p.status,code:p.code||''
   }));
 }
 async function sbSavePromo(promo){
-  const row={biz_id:promo.bizId,name:promo.name,deskripsi:promo.desc||'',
+  const row={biz_id:promo.bizId,name:promo.name,desc:promo.desc||'',
     type:promo.type,value:promo.value,min_buy:promo.minBuy||0,
     status:promo.status,code:promo.code||''};
   const res=await sbInsert('promos',row);
@@ -1200,28 +1204,58 @@ async function sbLoadAll(){
   const u=DB.currentUser;
   if(!u) return;
   showLoading('Memuat data...');
-  try{
-    if(u.role==='superadmin'){
-      await Promise.all([sbLoadBusinesses(),sbLoadUsers(),sbLoadTransactions(),sbLoadProducts(),sbLoadCustomers(),sbLoadPromos()]);
+  const loaders = u.role==='superadmin'
+    ? [sbLoadBusinesses(),sbLoadUsers(),sbLoadTransactions(),sbLoadProducts(),sbLoadCustomers(),sbLoadPromos()]
+    : [sbLoadBusinesses(),sbLoadUsers(),sbLoadProducts(u.bizId),sbLoadTransactions(u.bizId),sbLoadCustomers(u.bizId),sbLoadPromos(u.bizId)];
+  // Jalankan semua, jangan cancel jika salah satu gagal
+  const results = await Promise.allSettled(loaders);
+  const errors = results.filter(r=>r.status==='rejected').map(r=>r.reason?.message);
+  if(errors.length){
+    console.warn('Sebagian data gagal dimuat:', errors);
+    if(errors.length===loaders.length){
+      toast('Koneksi ke database gagal. Cek SQL schema di Supabase.','error');
     } else {
-      const biz=u.bizId;
-      await Promise.all([sbLoadBusinesses(),sbLoadUsers(),sbLoadProducts(biz),sbLoadTransactions(biz),sbLoadCustomers(biz),sbLoadPromos(biz)]);
+      toast('Sebagian data gagal dimuat dari Supabase.','warning');
     }
-  }catch(e){
-    toast('Gagal memuat data: '+e.message,'error');
-    console.error(e);
-  }finally{ hideLoading(); }
+  }
+  hideLoading();
 }
 
 // ── after DOM: init Lucide ──
 document.addEventListener('DOMContentLoaded', () => {
   lucide.createIcons();
-  // Restore dark mode icon if preference was saved
   if(localStorage.getItem('jb_dark')==='1'){
     const btn=document.getElementById('darkToggleBtn');
     if(btn){btn.innerHTML='<i data-lucide="sun"></i>';lucide.createIcons();}
   }
+  // Cek koneksi Supabase saat halaman load
+  checkSupabaseStatus();
 });
+
+async function checkSupabaseStatus(){
+  const banner=document.getElementById('sbStatusBanner');
+  if(!banner) return;
+  try{
+    const r=await fetch(`${SB_URL}/rest/v1/users?limit=1`,{headers:{...sbHeaders,'Prefer':''}});
+    if(r.ok){
+      banner.style.display='none';
+    } else {
+      const txt=await r.text();
+      if(txt.includes('relation') || txt.includes('does not exist') || r.status===404){
+        banner.innerHTML='&#9888; Tabel Supabase belum dibuat. Jalankan SQL schema dulu di Supabase SQL Editor.';
+        banner.style.background='#7c3aed22';
+        banner.style.color='#7c3aed';
+        banner.style.borderColor='#7c3aed55';
+      } else {
+        banner.innerHTML='&#9888; Koneksi Supabase error: '+r.status+'. Login akan pakai data lokal.';
+      }
+      banner.style.display='block';
+    }
+  }catch(e){
+    banner.innerHTML='&#9888; Tidak bisa terhubung ke Supabase. Pastikan URL & API key benar.';
+    banner.style.display='block';
+  }
+}
 
 // ── SVG helper: returns inline SVG string for use in innerHTML ──
 const LIC = {
@@ -1348,33 +1382,54 @@ async function doLogin(){
   const errEl=document.getElementById('loginError');
   const btn=document.querySelector('.btn-login');
   if(!e||!p){errEl.classList.add('show');return;}
-  btn.disabled=true;btn.innerHTML='<span style="opacity:.7">Memproses...</span>';
+  btn.disabled=true;
+  btn.innerHTML='<span style="opacity:.7">Memproses...</span>';
+  errEl.classList.remove('show');
+
+  // Coba load users dari Supabase, fallback ke DB lokal jika gagal
   try{
-    // Load users from Supabase first
     await sbLoadUsers();
-    const u=DB.users.find(x=>x.email===e&&x.pass===p);
-    if(!u){
-      errEl.classList.add('show');
-      document.getElementById('loginPass').value='';
-      document.getElementById('loginPass').focus();
-      btn.disabled=false;btn.innerHTML='<i data-lucide="log-in"></i> Masuk ke Platform';lucide.createIcons();
+  }catch(sbErr){
+    console.warn('Supabase users gagal dimuat, pakai data lokal:', sbErr.message);
+    if(!DB.users.find(u=>u.role==='superadmin')){
+      DB.users.unshift({id:0,name:'Super Admin',email:'admin@jagabisnis.id',role:'superadmin',bizId:null,pass:'admin123',initials:'SA'});
+    }
+  }
+
+  // Cek login case-insensitive email
+  const u=DB.users.find(x=>x.email.toLowerCase()===e.toLowerCase()&&x.pass===p);
+  if(!u){
+    errEl.classList.add('show');
+    document.getElementById('loginPass').value='';
+    document.getElementById('loginPass').focus();
+    btn.disabled=false;
+    btn.innerHTML='<i data-lucide="log-in"></i> Masuk ke Platform';
+    lucide.createIcons();
+    return;
+  }
+
+  // Cek status bisnis
+  try{ await sbLoadBusinesses(); }catch(e2){ console.warn('Gagal load bisnis:', e2.message); }
+  if(u.bizId){
+    const b=DB.businesses.find(x=>x.id===u.bizId);
+    if(b&&b.status==='inactive'){
+      toast('Akun bisnis tidak aktif. Hubungi Super Admin.','error');
+      btn.disabled=false;
+      btn.innerHTML='<i data-lucide="log-in"></i> Masuk ke Platform';
+      lucide.createIcons();
       return;
     }
-    errEl.classList.remove('show');
-    // Load businesses to check status
-    await sbLoadBusinesses();
-    if(u.bizId){const b=DB.businesses.find(x=>x.id===u.bizId);if(b&&b.status==='inactive'){toast('Akun bisnis tidak aktif. Hubungi Super Admin.','error');btn.disabled=false;btn.innerHTML='<i data-lucide="log-in"></i> Masuk ke Platform';lucide.createIcons();return;}}
-    DB.currentUser=u;
-    document.getElementById('splash').classList.add('out');
-    setTimeout(()=>document.getElementById('splash').style.display='none',500);
-    document.getElementById('app').classList.add('visible');
-    // Load all data then init
-    await sbLoadAll();
-    initApp();
-  }catch(err){
-    toast('Koneksi gagal: '+err.message,'error');
-    btn.disabled=false;btn.innerHTML='<i data-lucide="log-in"></i> Masuk ke Platform';lucide.createIcons();
   }
+
+  DB.currentUser=u;
+  document.getElementById('splash').classList.add('out');
+  setTimeout(()=>document.getElementById('splash').style.display='none',500);
+  document.getElementById('app').classList.add('visible');
+
+  // Load semua data (tidak blokir login jika Supabase belum setup)
+  try{ await sbLoadAll(); }catch(loadErr){ console.warn('Load data error:', loadErr.message); }
+
+  initApp();
 }
 function doLogout(){
   DB.cart=[];DB.activePromo=null;DB.currentUser=null;
@@ -2420,9 +2475,276 @@ function showTxDetail(id){
 }
 
 // ═══════════════════════════════ ADMIN REPORT ═══════════════════════════════
+
+// ══════════════════════════════════════════════════════════
+// ── EXPORT ENGINE (PDF & EXCEL) ──
+// ══════════════════════════════════════════════════════════
+
+function getBizName(){
+  const biz=DB.businesses.find(b=>b.id===gBizId());
+  return biz?biz.name:'JagaBisnis';
+}
+
+function exportHeaderInfo(type){
+  const biz=getBizName();
+  const now=new Date();
+  const tgl=now.toLocaleDateString('id-ID',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  const jam=now.toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'});
+  return {biz,tgl,jam,type};
+}
+
+// ─── EXCEL EXPORT ───
+function exportExcel(type){
+  const WB=XLSX.utils.book_new();
+  const info=exportHeaderInfo(type);
+  let ws, title;
+
+  if(type==='penjualan'){
+    title='Laporan Penjualan';
+    const txs=gTxs();
+    const header=[['Laporan Penjualan - '+info.biz],['Dicetak: '+info.tgl+' '+info.jam],[]];
+    const cols=[['Tanggal','Waktu','Customer','Kasir','Items','Total','Diskon','Metode','Status']];
+    const rows=txs.map(t=>[
+      t.date, t.time||'-', t.customer, t.kasir,
+      t.items.map(i=>i.name+' x'+i.qty).join('; '),
+      t.total, t.discount||0, t.payMethod||'cash', t.status
+    ]);
+    const summary=[
+      [],
+      ['RINGKASAN'],
+      ['Total Transaksi', txs.length],
+      ['Total Revenue', txs.reduce((s,t)=>s+t.total,0)],
+      ['Total Diskon', txs.reduce((s,t)=>s+(t.discount||0),0)],
+      ['Lunas', txs.filter(t=>t.status==='lunas').length],
+      ['Belum Lunas', txs.filter(t=>t.status!=='lunas').length],
+    ];
+    const data=[...header,...cols,...rows,...summary];
+    ws=XLSX.utils.aoa_to_sheet(data);
+    ws['!cols']=[{wch:12},{wch:8},{wch:18},{wch:14},{wch:40},{wch:14},{wch:10},{wch:10},{wch:12}];
+
+  } else if(type==='produk'){
+    title='Laporan Produk';
+    const txs=gTxs();
+    const prodMap={};
+    txs.forEach(t=>t.items.forEach(it=>{
+      if(!prodMap[it.name])prodMap[it.name]={name:it.name,qty:0,revenue:0};
+      prodMap[it.name].qty+=it.qty;
+      prodMap[it.name].revenue+=it.price*it.qty;
+    }));
+    DB.products.filter(p=>p.bizId===gBizId()).forEach(p=>{
+      if(!prodMap[p.name])prodMap[p.name]={name:p.name,qty:0,revenue:0};
+    });
+    const rows=Object.values(prodMap).sort((a,b)=>b.qty-a.qty);
+    const header=[['Laporan Produk - '+info.biz],['Dicetak: '+info.tgl+' '+info.jam],[]];
+    const cols=[['No','Nama Produk','Total Terjual (qty)','Revenue','% dari Total Revenue']];
+    const totalRev=rows.reduce((s,r)=>s+r.revenue,0);
+    const data=[...header,...cols,...rows.map((r,i)=>[
+      i+1, r.name, r.qty, r.revenue,
+      totalRev>0?(r.revenue/totalRev*100).toFixed(1)+'%':'0%'
+    ]),[],['TOTAL','',rows.reduce((s,r)=>s+r.qty,0),totalRev,'100%']];
+    ws=XLSX.utils.aoa_to_sheet(data);
+    ws['!cols']=[{wch:5},{wch:28},{wch:18},{wch:16},{wch:18}];
+
+  } else if(type==='customer'){
+    title='Laporan Customer';
+    const custs=gCusts().sort((a,b)=>b.total-a.total);
+    const header=[['Laporan Customer - '+info.biz],['Dicetak: '+info.tgl+' '+info.jam],[]];
+    const cols=[['No','Nama Customer','No. HP','Kunjungan','Total Spending','Avg/Kunjungan','Terakhir Kunjungan','Tier']];
+    const rows=custs.map((c,i)=>{
+      const avg=c.visits?Math.round(c.total/c.visits):0;
+      const tier=c.total>=500000?'VIP':c.total>=200000?'Reguler':'Baru';
+      return[i+1,c.name,c.phone||'-',c.visits,c.total,avg,c.lastVisit,tier];
+    });
+    const summary=[[],['RINGKASAN'],['Total Customer',custs.length],['Total Spending',custs.reduce((s,c)=>s+c.total,0)],['Rata-rata Spending',custs.length?Math.round(custs.reduce((s,c)=>s+c.total,0)/custs.length):0]];
+    const data=[...header,...cols,...rows,...summary];
+    ws=XLSX.utils.aoa_to_sheet(data);
+    ws['!cols']=[{wch:5},{wch:22},{wch:16},{wch:12},{wch:16},{wch:16},{wch:20},{wch:10}];
+  }
+
+  XLSX.utils.book_append_sheet(WB, ws, title.slice(0,31));
+  XLSX.writeFile(WB, `${title.replace(/ /g,'_')}_${info.biz.replace(/ /g,'_')}_${new Date().toISOString().slice(0,10)}.xlsx`);
+  toast('Export Excel berhasil!','success');
+}
+
+// ─── PDF EXPORT ───
+function exportPDF(type){
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
+  const info=exportHeaderInfo(type);
+  const W=doc.internal.pageSize.getWidth();
+
+  // Header
+  doc.setFillColor(26,86,219);
+  doc.rect(0,0,W,18,'F');
+  doc.setTextColor(255,255,255);
+  doc.setFontSize(13);doc.setFont('helvetica','bold');
+
+  let titleStr='';
+  if(type==='penjualan') titleStr='LAPORAN PENJUALAN';
+  else if(type==='produk') titleStr='LAPORAN PRODUK';
+  else if(type==='customer') titleStr='LAPORAN CUSTOMER';
+
+  doc.text(titleStr+' — '+info.biz.toUpperCase(), 14, 11);
+  doc.setFontSize(8);doc.setFont('helvetica','normal');
+  doc.text('Dicetak: '+info.tgl+' pukul '+info.jam, W-14, 11, {align:'right'});
+
+  doc.setTextColor(0,0,0);
+  let startY=24;
+
+  if(type==='penjualan'){
+    const txs=gTxs();
+    const totRev=txs.reduce((s,t)=>s+t.total,0);
+    const totDis=txs.reduce((s,t)=>s+(t.discount||0),0);
+
+    // Summary boxes
+    const boxes=[
+      {label:'Total Transaksi',val:txs.length},
+      {label:'Total Revenue',val:'Rp '+fmt(totRev)},
+      {label:'Total Diskon',val:'Rp '+fmt(totDis)},
+      {label:'Lunas',val:txs.filter(t=>t.status==='lunas').length+' / '+txs.length},
+    ];
+    const bw=(W-28)/4;
+    boxes.forEach((b,i)=>{
+      const x=14+i*(bw+2);
+      doc.setFillColor(235,242,255);doc.roundedRect(x,startY,bw,14,2,2,'F');
+      doc.setFontSize(7);doc.setTextColor(100,100,100);doc.text(b.label,x+bw/2,startY+5,{align:'center'});
+      doc.setFontSize(10);doc.setTextColor(26,86,219);doc.setFont('helvetica','bold');
+      doc.text(String(b.val),x+bw/2,startY+11,{align:'center'});
+      doc.setFont('helvetica','normal');
+    });
+    startY+=20;
+
+    // Table
+    const head=[['Tanggal','Customer','Kasir','Items','Total','Diskon','Metode','Status']];
+    const body=txs.map(t=>[
+      t.date, t.customer, t.kasir,
+      t.items.map(i=>i.name+' x'+i.qty).join(', ').slice(0,40)+(t.items.length>2?'...':''),
+      'Rp '+fmt(t.total), t.discount?'Rp '+fmt(t.discount):'-',
+      (t.payMethod||'cash').toUpperCase(),
+      t.status==='lunas'?'LUNAS':'BELUM'
+    ]);
+    doc.autoTable({
+      head,body,startY,
+      styles:{fontSize:7,cellPadding:2},
+      headStyles:{fillColor:[26,86,219],textColor:255,fontStyle:'bold'},
+      alternateRowStyles:{fillColor:[248,250,252]},
+      columnStyles:{0:{cellWidth:20},1:{cellWidth:28},2:{cellWidth:22},3:{cellWidth:55},4:{cellWidth:24},5:{cellWidth:18},6:{cellWidth:18},7:{cellWidth:18}},
+      didDrawPage:(data)=>{
+        doc.setFontSize(7);doc.setTextColor(150);
+        doc.text('JagaBisnis POS — '+info.biz+' | Hal '+doc.internal.getCurrentPageInfo().pageNumber,14,doc.internal.pageSize.getHeight()-6);
+      }
+    });
+
+  } else if(type==='produk'){
+    const txs=gTxs();
+    const prodMap={};
+    txs.forEach(t=>t.items.forEach(it=>{
+      if(!prodMap[it.name])prodMap[it.name]={name:it.name,qty:0,revenue:0};
+      prodMap[it.name].qty+=it.qty;prodMap[it.name].revenue+=it.price*it.qty;
+    }));
+    DB.products.filter(p=>p.bizId===gBizId()).forEach(p=>{if(!prodMap[p.name])prodMap[p.name]={name:p.name,qty:0,revenue:0};});
+    const rows=Object.values(prodMap).sort((a,b)=>b.qty-a.qty);
+    const totalRev=rows.reduce((s,r)=>s+r.revenue,0);
+    const totalQty=rows.reduce((s,r)=>s+r.qty,0);
+
+    const boxes=[
+      {label:'Total Produk',val:rows.length},
+      {label:'Total Terjual',val:totalQty+' pcs'},
+      {label:'Revenue Produk',val:'Rp '+fmt(totalRev)},
+      {label:'Produk Terlaris',val:rows[0]?rows[0].name.slice(0,14):'—'},
+    ];
+    const bw=(W-28)/4;
+    boxes.forEach((b,i)=>{
+      const x=14+i*(bw+2);
+      doc.setFillColor(235,242,255);doc.roundedRect(x,startY,bw,14,2,2,'F');
+      doc.setFontSize(7);doc.setTextColor(100,100,100);doc.text(b.label,x+bw/2,startY+5,{align:'center'});
+      doc.setFontSize(9);doc.setTextColor(26,86,219);doc.setFont('helvetica','bold');
+      doc.text(String(b.val),x+bw/2,startY+11,{align:'center'});
+      doc.setFont('helvetica','normal');
+    });
+    startY+=20;
+
+    const head=[['#','Nama Produk','Terjual (qty)','Revenue','% Revenue']];
+    const body=rows.map((r,i)=>[
+      i+1, r.name, r.qty+' pcs',
+      'Rp '+fmt(r.revenue),
+      totalRev>0?(r.revenue/totalRev*100).toFixed(1)+'%':'0%'
+    ]);
+    doc.autoTable({
+      head,body,startY,
+      styles:{fontSize:8,cellPadding:2.5},
+      headStyles:{fillColor:[26,86,219],textColor:255,fontStyle:'bold'},
+      alternateRowStyles:{fillColor:[248,250,252]},
+      columnStyles:{0:{cellWidth:12},1:{cellWidth:80},2:{cellWidth:30},3:{cellWidth:35},4:{cellWidth:25}},
+      didDrawPage:(data)=>{
+        doc.setFontSize(7);doc.setTextColor(150);
+        doc.text('JagaBisnis POS — '+info.biz+' | Hal '+doc.internal.getCurrentPageInfo().pageNumber,14,doc.internal.pageSize.getHeight()-6);
+      }
+    });
+
+  } else if(type==='customer'){
+    const custs=gCusts().sort((a,b)=>b.total-a.total);
+    const totSpend=custs.reduce((s,c)=>s+c.total,0);
+    const avg=custs.length?Math.round(totSpend/custs.length):0;
+
+    const boxes=[
+      {label:'Total Customer',val:custs.length},
+      {label:'Total Spending',val:'Rp '+fmt(totSpend)},
+      {label:'Rata-rata Spending',val:'Rp '+fmt(avg)},
+      {label:'Customer VIP',val:custs.filter(c=>c.total>=500000).length+' orang'},
+    ];
+    const bw=(W-28)/4;
+    boxes.forEach((b,i)=>{
+      const x=14+i*(bw+2);
+      doc.setFillColor(235,242,255);doc.roundedRect(x,startY,bw,14,2,2,'F');
+      doc.setFontSize(7);doc.setTextColor(100,100,100);doc.text(b.label,x+bw/2,startY+5,{align:'center'});
+      doc.setFontSize(9);doc.setTextColor(26,86,219);doc.setFont('helvetica','bold');
+      doc.text(String(b.val),x+bw/2,startY+11,{align:'center'});
+      doc.setFont('helvetica','normal');
+    });
+    startY+=20;
+
+    const head=[['#','Nama Customer','No. HP','Kunjungan','Total Spending','Avg/Kunjungan','Terakhir','Tier']];
+    const body=custs.map((c,i)=>{
+      const avgV=c.visits?Math.round(c.total/c.visits):0;
+      const tier=c.total>=500000?'VIP':c.total>=200000?'Reguler':'Baru';
+      return[i+1,c.name,c.phone||'-',c.visits+'x','Rp '+fmt(c.total),'Rp '+fmt(avgV),c.lastVisit,tier];
+    });
+    doc.autoTable({
+      head,body,startY,
+      styles:{fontSize:7.5,cellPadding:2},
+      headStyles:{fillColor:[26,86,219],textColor:255,fontStyle:'bold'},
+      alternateRowStyles:{fillColor:[248,250,252]},
+      columnStyles:{0:{cellWidth:10},1:{cellWidth:35},2:{cellWidth:25},3:{cellWidth:18},4:{cellWidth:28},5:{cellWidth:28},6:{cellWidth:22},7:{cellWidth:18}},
+      didDrawPage:(data)=>{
+        doc.setFontSize(7);doc.setTextColor(150);
+        doc.text('JagaBisnis POS — '+info.biz+' | Hal '+doc.internal.getCurrentPageInfo().pageNumber,14,doc.internal.pageSize.getHeight()-6);
+      }
+    });
+  }
+
+  const fn=titleStr.replace(/ /g,'_')+'_'+info.biz.replace(/ /g,'_')+'_'+new Date().toISOString().slice(0,10)+'.pdf';
+  doc.save(fn);
+  toast('Export PDF berhasil!','success');
+}
+
+// ─── Export button HTML helper ───
+function exportButtons(type){
+  return `<div style="display:flex;gap:8px;margin-left:auto">
+    <button class="btn btn-outline btn-sm" onclick="exportExcel('${type}')" style="color:#10B981;border-color:#10B981;gap:5px">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
+      Excel
+    </button>
+    <button class="btn btn-outline btn-sm" onclick="exportPDF('${type}')" style="color:#EF4444;border-color:#EF4444;gap:5px">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
+      PDF
+    </button>
+  </div>`;
+}
+
 function renderAdminReport(){
   document.getElementById('mainContent').innerHTML=`
-    <div class="page-header"><h2>Laporan Penjualan</h2></div>
+    <div class="page-header"><h2>Laporan Penjualan</h2>${exportButtons('penjualan')}</div>
     <div class="tab-bar">
       <div class="tab active" id="tab-harian" onclick="switchReportTab('harian')">Harian</div>
       <div class="tab" id="tab-bulanan" onclick="switchReportTab('bulanan')">Bulanan</div>
@@ -2480,7 +2802,7 @@ function renderAdminReportProduk(sort){
   else if(sort==='revenue')rows.sort((a,b)=>b.revenue-a.revenue);
   const maxQty=Math.max(...rows.map(r=>r.qty),1);
   document.getElementById('mainContent').innerHTML=`
-    <div class="page-header"><h2>Laporan Produk</h2></div>
+    <div class="page-header"><h2>Laporan Produk</h2>${exportButtons('produk')}</div>
     <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
       <button class="btn ${sort==='laris'?'btn-primary':'btn-outline'} btn-sm" onclick="renderAdminReportProduk('laris')">${LIC.chart} Terlaris</button>
       <button class="btn ${sort==='kurang'?'btn-primary':'btn-outline'} btn-sm" onclick="renderAdminReportProduk('kurang')">${LIC.chart} Kurang Laku</button>
@@ -2515,7 +2837,7 @@ function renderAdminReportCust(sort){
   const totSpend=custs.reduce((s,c)=>s+c.total,0);
   const avg=custs.length?Math.round(totSpend/custs.length):0;
   document.getElementById('mainContent').innerHTML=`
-    <div class="page-header"><h2>Laporan Customer</h2></div>
+    <div class="page-header"><h2>Laporan Customer</h2>${exportButtons('customer')}</div>
     <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
       <button class="btn ${sort==='spending'?'btn-primary':'btn-outline'} btn-sm" onclick="renderAdminReportCust('spending')">${LIC.money} Spending Tertinggi</button>
       <button class="btn ${sort==='visits'?'btn-primary':'btn-outline'} btn-sm" onclick="renderAdminReportCust('visits')">${LIC.users} Paling Sering</button>
@@ -3306,20 +3628,27 @@ function showReceipt(tx,biz){
           style="width:100%;padding:8px 11px;border:1px solid #86efac;border-radius:6px;font-family:inherit;font-size:13px;background:#fff;outline:none;color:#111">
       </div>
       <!-- Dua pilihan share -->
-      <div class="wa-share-options">
-        <div class="wa-share-opt" onclick="kirimStrukonlineWA(${tx.id})">
-          <div class="wa-share-opt-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+      <div class="wa-share-options" style="grid-template-columns:1fr 1fr 1fr;gap:6px">
+        <div class="wa-share-opt" onclick="kirimStrukonlineWA(${tx.id})" style="padding:10px">
+          <div class="wa-share-opt-icon" style="width:30px;height:30px;margin-bottom:4px">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
           </div>
-          <div class="wa-share-opt-label">Kirim Link Struk</div>
-          <div class="wa-share-opt-sub">Teks + link bisa dibuka di browser</div>
+          <div class="wa-share-opt-label" style="font-size:11px">Kirim WA</div>
+          <div class="wa-share-opt-sub">Link struk</div>
         </div>
-        <div class="wa-share-opt" onclick="kirimGambarStuk(${tx.id})">
-          <div class="wa-share-opt-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+        <div class="wa-share-opt" onclick="strukShareWA(${tx.id})" style="padding:10px">
+          <div class="wa-share-opt-icon" style="width:30px;height:30px;margin-bottom:4px">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
           </div>
-          <div class="wa-share-opt-label">Kirim Gambar Struk</div>
-          <div class="wa-share-opt-sub">Screenshot struk dikirim langsung</div>
+          <div class="wa-share-opt-label" style="font-size:11px">Gambar WA</div>
+          <div class="wa-share-opt-sub">PNG image</div>
+        </div>
+        <div class="wa-share-opt" onclick="showStrukOptions(${tx.id})" style="padding:10px">
+          <div class="wa-share-opt-icon" style="width:30px;height:30px;margin-bottom:4px;background:#3B82F6">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+          </div>
+          <div class="wa-share-opt-label" style="font-size:11px">Simpan/Cetak</div>
+          <div class="wa-share-opt-sub">PDF, PNG, Print</div>
         </div>
       </div>
     </div>` : `
@@ -3505,6 +3834,153 @@ Sampai jumpa kembali 😊`;
 }
 
 // quick send dari riwayat (tanpa extra msg)
+
+// ═══════════════════════════════ IMPROVED STRUK SAVE/SHARE (MOBILE-FRIENDLY) ═══════════════════════════════
+function showStrukOptions(txId){
+  const t=DB.transactions.find(x=>x.id===txId);
+  const biz=DB.businesses.find(b=>b.id===t.bizId);
+  if(!t || !biz) return;
+  
+  const waMsg = `🧾 *STRUK BELANJA - ${biz.name}*\n📅 ${t.date} ${t.time||''}\n🔖 TXN-00${t.id}\n💰 Total: Rp${t.total.toLocaleString('id-ID')}`;
+  
+  showModal(`
+    <div class="modal-title">Pilih Cara Simpan/Kirim Struk</div>
+    <div style="font-size:12px;color:var(--text3);margin-bottom:18px;line-height:1.6">
+      Struk TXN-00${t.id} untuk <strong>${t.customer}</strong>.<br>
+      Pilih cara yang cocok untuk Anda:
+    </div>
+    
+    <div style="display:flex;flex-direction:column;gap:9px">
+      
+      <!-- SAVE PDF -->
+      <button class="btn btn-primary" style="justify-content:center;gap:8px;font-size:13px;flex:1" onclick="strukSavePDF(${txId})">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        💾 Simpan PDF
+      </button>
+      
+      <!-- SAVE IMAGE -->
+      <button class="btn btn-outline" style="justify-content:center;gap:8px;font-size:13px;flex:1" onclick="strukSaveImage(${txId})">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+        🖼️ Simpan Gambar
+      </button>
+      
+      <!-- SHARE WHATSAPP -->
+      ${t.phone ? `<button class="btn btn-wa" style="justify-content:center;gap:8px;font-size:13px;flex:1" onclick="strukShareWA(${txId})">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+        📱 Kirim ke WhatsApp
+      </button>` : ''}
+      
+      <!-- PRINT -->
+      <button class="btn btn-outline" style="justify-content:center;gap:8px;font-size:13px;flex:1;color:#3B82F6;border-color:#3B82F6" onclick="strukPrint(${txId})">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+        🖨️ Cetak
+      </button>
+      
+      <button class="btn btn-outline" style="justify-content:center;flex:1" onclick="closeModal()">
+        ✕ Batal
+      </button>
+      
+    </div>
+  `);
+}
+
+function strukSavePDF(txId){
+  const t=DB.transactions.find(x=>x.id===txId);
+  const biz=DB.businesses.find(b=>b.id===t.bizId);
+  if(!t || !biz) return;
+  
+  // Create canvas
+  const canvas = document.createElement('canvas');
+  canvas.id = 'tempStrukCanvas';
+  document.body.appendChild(canvas);
+  
+  buatGambarStruk(t, biz, '', '', (success) => {
+    if(!success) { toast('Gagal membuat struk','error'); return; }
+    const canvas = document.getElementById('tempStrukCanvas');
+    const {jsPDF} = window.jspdf;
+    const imgData = canvas.toDataURL('image/png');
+    const canvHeight = (canvas.height / canvas.width) * 210;
+    const pdf = new jsPDF({orientation:'portrait', unit:'mm', format:[210, canvHeight]});
+    pdf.addImage(imgData, 'PNG', 0, 0, 210, canvHeight);
+    pdf.save(`struk-TXN-00${t.id}.pdf`);
+    document.body.removeChild(canvas);
+    toast('✅ PDF berhasil disimpan ke Downloads!','success');
+    closeModal();
+  });
+}
+
+function strukSaveImage(txId){
+  const t=DB.transactions.find(x=>x.id===txId);
+  const biz=DB.businesses.find(b=>b.id===t.bizId);
+  if(!t || !biz) return;
+  
+  const canvas = document.createElement('canvas');
+  canvas.id = 'tempStrukCanvas';
+  document.body.appendChild(canvas);
+  
+  buatGambarStruk(t, biz, '', '', (success) => {
+    if(!success) { toast('Gagal membuat gambar','error'); return; }
+    const canvas = document.getElementById('tempStrukCanvas');
+    canvas.toBlob(blob => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `struk-TXN-00${t.id}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      document.body.removeChild(canvas);
+      toast('✅ Gambar berhasil disimpan!','success');
+      closeModal();
+    }, 'image/png');
+  });
+}
+
+function strukShareWA(txId){
+  const t=DB.transactions.find(x=>x.id===txId);
+  const biz=DB.businesses.find(b=>b.id===t.bizId);
+  if(!t || !biz) return;
+  if(!t.phone) { toast('Nomor HP tidak tersedia','error'); return; }
+  
+  const itemLines=t.items.map(it=>`  • ${it.name} ×${it.qty} = Rp${(it.price*it.qty).toLocaleString('id-ID')}`).join('\n');
+  const discLine=t.discount?`\n🏷️ Diskon: -Rp${t.discount.toLocaleString('id-ID')}':'';
+  const msg = `🧾 *STRUK BELANJA DIGITAL*\n━━━━━━━━━━━━━━━━━━\n🏪 *${biz.name}*\n📅 ${t.date} ${t.time||''}\n🔖 TXN-00${t.id}\n━━━━━━━━━━━━━━━━━━\n${itemLines}${discLine}\n💰 *TOTAL: Rp${t.total.toLocaleString('id-ID')}*\n━━━━━━━━━━━━━━━━━━\n🙏 Terima kasih telah berbelanja di ${biz.name}!`;
+  
+  openWA(t.phone, msg);
+  toast(`📱 Membuka WhatsApp untuk ${t.customer}...`,'success');
+  closeModal();
+}
+
+function strukPrint(txId){
+  const t=DB.transactions.find(x=>x.id===txId);
+  const biz=DB.businesses.find(b=>b.id===t.bizId);
+  if(!t || !biz) return;
+  
+  const canvas = document.createElement('canvas');
+  canvas.id = 'tempStrukCanvas';
+  document.body.appendChild(canvas);
+  
+  buatGambarStruk(t, biz, '', '', (success) => {
+    if(!success) { toast('Gagal membuat struk','error'); return; }
+    const canvas = document.getElementById('tempStrukCanvas');
+    const imgData = canvas.toDataURL('image/png');
+    const printWindow = window.open('', '', 'width=400,height=700');
+    printWindow.document.write(`
+      <html><head><title>Print Struk TXN-00${t.id}</title>
+      <style>body{margin:0;padding:8px;background:#fff}img{max-width:100%;height:auto}@media print{body{margin:0;padding:0}}</style>
+      </head><body onload="window.print();window.close()"><img src="${imgData}"></body></html>
+    `);
+    document.body.removeChild(canvas);
+    toast('🖨️ Halaman cetak dibuka','success');
+    closeModal();
+  });
+}
+
+// Alias untuk backward compatibility
+function kirimStrukonlineWA_NEW(txId){ showStrukOptions(txId); }
+
+
 function kirimStrukonlineWAQuick(txId){
   const t=DB.transactions.find(x=>x.id===txId);
   // Create a temporary waExtraMsg element
